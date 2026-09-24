@@ -1,20 +1,22 @@
 """Pydantic 模型：请求与响应结构。
 
-所有频率均为整数 Hz。任一字段校验失败都会使整个请求被拒绝（整批拒绝），
-服务端不会写入任何部分数据。
+所有频率均为整数 Hz。请求体中的整数字段仅接受 JSON 整数（严格整数校验）：
+布尔值（true/false）、浮点数（含 1.0 这类整数值浮点）与数字字符串一律
+拒绝（422），不做隐式类型转换。任一字段校验失败都会使整个请求被拒绝
+（整批拒绝），服务端不会写入任何部分数据。
 """
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
 
 class GuardBand(BaseModel):
     """保护频段，闭区间 [start_hz, end_hz]。"""
 
-    start_hz: int = Field(..., gt=0, description="频段起点（含），整数 Hz")
-    end_hz: int = Field(..., gt=0, description="频段终点（含），整数 Hz")
+    start_hz: StrictInt = Field(..., gt=0, description="频段起点（含），整数 Hz")
+    end_hz: StrictInt = Field(..., gt=0, description="频段终点（含），整数 Hz")
 
     @model_validator(mode="after")
     def _check_order(self) -> "GuardBand":
@@ -27,12 +29,12 @@ class SiteCreate(BaseModel):
     """创建站点（频率方案）的请求体。"""
 
     name: str = Field(..., min_length=1, max_length=128, description="方案名称，全局唯一")
-    scan_start_hz: int = Field(..., gt=0, description="扫描范围起点（含），整数 Hz")
-    scan_end_hz: int = Field(..., gt=0, description="扫描范围终点（含），整数 Hz")
-    guard_interval_hz: int = Field(
+    scan_start_hz: StrictInt = Field(..., gt=0, description="扫描范围起点（含），整数 Hz")
+    scan_end_hz: StrictInt = Field(..., gt=0, description="扫描范围终点（含），整数 Hz")
+    guard_interval_hz: StrictInt = Field(
         ..., ge=0, description="保护间隔：产物到命中对象的距离小于该值判定为违规"
     )
-    carriers_hz: list[int] = Field(..., min_length=1, description="载频列表，整数 Hz，不允许重复")
+    carriers_hz: list[StrictInt] = Field(..., min_length=1, description="载频列表，整数 Hz，不允许重复")
     guard_bands: list[GuardBand] = Field(default_factory=list, description="保护频段列表")
 
     @field_validator("carriers_hz")
@@ -103,7 +105,7 @@ class AnalysisMeta(BaseModel):
 class BatchAnalysisRequest(BaseModel):
     """多站点原子批量分析请求：1～10 个不重复的已保存站点 ID。"""
 
-    site_ids: list[int] = Field(
+    site_ids: list[StrictInt] = Field(
         ...,
         min_length=1,
         max_length=10,
@@ -244,9 +246,9 @@ class CarrierExclusionResult(BaseModel):
 class CarrierRelocationRequest(BaseModel):
     """单载频迁移规划请求：待替换载频与候选整数闭区间。"""
 
-    old_hz: int = Field(..., gt=0, description="待替换的现有载频，整数 Hz")
-    start_hz: int = Field(..., gt=0, description="候选区间起点（含），整数 Hz")
-    end_hz: int = Field(..., gt=0, description="候选区间终点（含），整数 Hz")
+    old_hz: StrictInt = Field(..., gt=0, description="待替换的现有载频，整数 Hz")
+    start_hz: StrictInt = Field(..., gt=0, description="候选区间起点（含），整数 Hz")
+    end_hz: StrictInt = Field(..., gt=0, description="候选区间终点（含），整数 Hz")
 
     @model_validator(mode="after")
     def _check_order(self) -> "CarrierRelocationRequest":
@@ -278,8 +280,8 @@ class CarrierRelocationResult(BaseModel):
 class CarrierTolerance(BaseModel):
     """单个载频的漂移容差条目。"""
 
-    carrier_hz: int = Field(..., gt=0, description="载频，整数 Hz")
-    tolerance_hz: int = Field(
+    carrier_hz: StrictInt = Field(..., gt=0, description="载频，整数 Hz")
+    tolerance_hz: StrictInt = Field(
         ..., ge=0, le=1_000_000, description="漂移容差：0～1000000 的整数 Hz"
     )
 
@@ -337,10 +339,10 @@ class DriftRiskResult(BaseModel):
 class CrossSiteConflictsRequest(BaseModel):
     """跨站点互调冲突检测请求：2～8 个已保存站点 ID 与频率容差。"""
 
-    site_ids: list[int] = Field(
+    site_ids: list[StrictInt] = Field(
         ..., min_length=2, max_length=8, description="已保存站点 ID 列表，取 2～8 个，不允许重复"
     )
-    tolerance_hz: int = Field(
+    tolerance_hz: StrictInt = Field(
         ...,
         ge=0,
         description="频率容差（整数 Hz）：不同站点产物频率差不超过该值即判为冲突配对；0 表示仅同频配对",

@@ -2536,6 +2536,125 @@ def test_build_scan_windows_unit_matches_exact_optimum():
     assert build_scan_windows(empty, 5, 13, 5, 3).window_count == 0
 
 
+# ---------------------------------------------------------------- 严格整数校验（拒绝隐式类型转换）
+
+def test_create_site_rejects_non_integer_json_types(client):
+    # 站点配置（含保护频段、载频列表）的整数字段仅接受 JSON 整数：
+    # 布尔（true/false）、浮点（含 1.0 这类整数值浮点）、数字字符串一律 422
+    bad_payloads = [
+        make_payload(scan_start_hz=True),   # true 不得当作 1
+        make_payload(scan_end_hz=False),    # false 不得当作 0
+        make_payload(guard_interval_hz=True),
+        make_payload(scan_start_hz=1.0),
+        make_payload(guard_interval_hz=1.5),
+        make_payload(scan_end_hz="10000"),
+        make_payload(carriers_hz=[100, True, 400]),
+        make_payload(carriers_hz=[100, 300.0, 400]),
+        make_payload(carriers_hz=[100, "300", 400]),
+        make_payload(guard_bands=[{"start_hz": True, "end_hz": 520}]),
+        make_payload(guard_bands=[{"start_hz": 480, "end_hz": 520.0}]),
+        make_payload(guard_bands=[{"start_hz": "480", "end_hz": 520}]),
+    ]
+    for payload in bad_payloads:
+        resp = client.post("/sites", json=payload)
+        assert resp.status_code == 422, payload
+    assert client.get("/sites").json() == []  # 整批拒绝，未写入任何数据
+
+
+def test_create_site_plain_json_integers_unchanged(client):
+    # 合法 JSON 整数（含边界值 0 与大整数）的响应与结果不变
+    resp = client.post(
+        "/sites",
+        json=make_payload(
+            scan_end_hz=10**15,
+            guard_interval_hz=0,
+            guard_bands=[{"start_hz": 480, "end_hz": 520}],
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["scan_start_hz"] == 1
+    assert body["scan_end_hz"] == 10**15
+    assert body["guard_interval_hz"] == 0
+    assert body["carriers_hz"] == [100, 300, 400]
+    assert body["guard_bands"] == [{"start_hz": 480, "end_hz": 520}]
+    # 合法整数创建后分析结果与既有语义一致
+    analysis = client.post("/sites/1/analysis")
+    assert analysis.status_code == 201
+    assert [p["freq_hz"] for p in analysis.json()["products"]] == [200, 500, 700]
+
+
+def test_batch_analysis_rejects_non_integer_site_ids(client):
+    _make_site(client, 1)
+    _make_site(client, 2)
+    # 布尔 / 浮点 / 数字字符串的站点 ID 一律 422：true 不得当作 1
+    for bad_ids in ([True, 2], [1, False], [1.0, 2], [1, 2.5], ["1", 2]):
+        resp = client.post("/sites/analyses/batch", json={"site_ids": bad_ids})
+        assert resp.status_code == 422, bad_ids
+    # 整批拒绝：不启动分析、不保存任何记录
+    assert client.get("/sites/1/analyses").json() == []
+    assert client.get("/sites/2/analyses").json() == []
+    # 合法整数不受影响
+    ok = client.post("/sites/analyses/batch", json={"site_ids": [1, 2]})
+    assert ok.status_code == 201, ok.text
+    assert [r["site_id"] for r in ok.json()] == [1, 2]
+
+
+def test_cross_site_conflicts_rejects_non_integer_params(client):
+    _make_site(client, 1)
+    _make_site(client, 2)
+    _analyze(client, 1)
+    _analyze(client, 2)
+    bad_bodies = [
+        {"site_ids": [True, 2], "tolerance_hz": 10},  # [true, 2] 不得当作 [1, 2]
+        {"site_ids": [1, 2], "tolerance_hz": True},
+        {"site_ids": [1.0, 2], "tolerance_hz": 10},
+        {"site_ids": [1, 2], "tolerance_hz": 1.0},
+        {"site_ids": ["1", 2], "tolerance_hz": 10},
+        {"site_ids": [1, 2], "tolerance_hz": "10"},
+    ]
+    for body in bad_bodies:
+        resp = client.post("/cross-site-conflicts", json=body)
+        assert resp.status_code == 422, body
+    # 合法整数不受影响：响应与结果不变
+    ok = client.post("/cross-site-conflicts", json={"site_ids": [1, 2], "tolerance_hz": 10})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["site_ids"] == [1, 2]
+    assert ok.json()["tolerance_hz"] == 10
+
+
+def test_carrier_relocation_rejects_non_integer_fields(client):
+    client.post("/sites", json=make_payload())
+    url = "/sites/1/carrier-relocation"
+    for body in (
+        {"old_hz": True, "start_hz": 1, "end_hz": 100},
+        {"old_hz": 100, "start_hz": 1.0, "end_hz": 100},
+        {"old_hz": 100, "start_hz": 1, "end_hz": "100"},
+        {"old_hz": "100", "start_hz": 1, "end_hz": 100},
+    ):
+        assert client.post(url, json=body).status_code == 422, body
+    # 合法整数不受影响
+    ok = client.post(url, json={"old_hz": 100, "start_hz": 1, "end_hz": 10000})
+    assert ok.status_code == 200, ok.text
+
+
+def test_drift_risk_rejects_non_integer_tolerance_entries(client):
+    client.post("/sites", json=make_payload())  # 载频 [100, 300, 400]
+    url = "/sites/1/drift-risk"
+    bad_bodies = [
+        _drift_body([(True, 0), (300, 0), (400, 0)]),
+        _drift_body([(100, 1.0), (300, 0), (400, 0)]),
+        _drift_body([(100, "10"), (300, 0), (400, 0)]),
+        _drift_body([(100.0, 0), (300, 0), (400, 0)]),
+        _drift_body([(100, 0), (300, 0), ("400", 0)]),
+    ]
+    for body in bad_bodies:
+        assert client.post(url, json=body).status_code == 422, body
+    # 合法整数不受影响
+    ok = _drift_body([(100, 10), (300, 20), (400, 30)])
+    assert client.post(url, json=ok).status_code == 200
+
+
 # ---------------------------------------------------------------- 运维备份
 
 BACKUP_TOKEN = "test-backup-token"
