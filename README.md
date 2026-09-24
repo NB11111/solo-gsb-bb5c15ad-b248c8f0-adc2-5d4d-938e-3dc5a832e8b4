@@ -174,8 +174,10 @@ curl 'http://localhost:8000/analyses/1/scan-windows?width_hz=301&max_windows=1'
 
 `POST /sites/{site_id}/carrier-relocation` 规划把现有载频 `old_hz` 迁移到候选整数
 闭区间 `[start_hz, end_hz]` 内的某个频率 `x`，**不修改站点配置，也不保存分析**。
-请求体为 JSON：`old_hz`、`start_hz`、`end_hz` 均为正整数 Hz（字段缺失/非法或
-`start_hz > end_hz` → `422`；`old_hz` 不是该站点载频 → `422`；站点不存在 → `404`）。
+请求体为 JSON：`old_hz`、`start_hz`、`end_hz` 均为正整数 Hz（**只接受 JSON 整数**：
+布尔值、浮点数、数字字符串一律 `422`，不会把 `true` 当 `1`、`1.0`/`"1"` 当 `1`；
+字段缺失/非法或 `start_hz > end_hz` → `422`；`old_hz` 不是该站点载频 → `422`；
+站点不存在 → `404`）。
 
 - **可行判定**：把 `old_hz` 替换为 `x` 后，新载频集合按与分析一致的语义判定——
   每个落在扫描范围内的三阶产物 `2·fa − fb`（`fa ≠ fb`）到任一**新**载频
@@ -238,8 +240,9 @@ curl -X POST http://localhost:8000/sites/1/carrier-relocation \
 
 `POST /sites/{site_id}/drift-risk` 评估载频独立漂移下全频域的潜在互调风险，
 **不执行也不保存分析**。请求体须为该站点**每个载频**提供唯一且完整的漂移容差
-`tolerance_hz`（0～1000000 的整数 Hz；映射缺失、重复、多余或容差非法 → `422`；
-站点不存在 → `404`）。
+`tolerance_hz`（0～1000000 的整数 Hz）。条目中的 `carrier_hz`/`tolerance_hz` **只接受
+JSON 整数**（布尔值、浮点数、数字字符串 → `422`，不做 `true→1`、`1.0→1`、`"1"→1`
+隐式转换）；映射缺失、重复、多余或容差非法 → `422`；站点不存在 → `404`。
 
 - **共享变量建模**：每个载频 `c` 的实际频率为 `c + δ_c`，`δ_c ∈ [−t_c, +t_c]`，
   不同载频的漂移互相独立，但同一载频的漂移是共享变量。对每个有序来源
@@ -317,8 +320,11 @@ curl -X POST http://localhost:8000/sites/1/drift-risk \
 ## 跨站点冲突检测（cross-site conflicts）
 
 `POST /cross-site-conflicts` 接收 **2～8 个已保存站点 ID** 与非负整数频率容差
-`tolerance_hz`（`0` 表示仅同频配对；站点数越界、ID 重复或非正、容差非法 → `422`），
-读取每个站点**最近一次**分析结果（不重新扫描；站点不存在 → `404`，存在但尚无分析 → `404`）。
+`tolerance_hz`（`0` 表示仅同频配对；站点数越界、ID 重复或非正、容差非法 → `422`）。
+`site_ids` 与 `tolerance_hz` **只接受 JSON 整数**：`[true, 2]` 不会被当成 `[1, 2]`，
+`tolerance_hz` 传 `true`、`10.0`、`"10"` 同样返回 `422`；参数非法时直接拒绝，
+不启动分析、不写库。读取每个站点**最近一次**分析结果（不重新扫描；
+站点不存在 → `404`，存在但尚无分析 → `404`）。
 
 - **配对规则**：仅在**不同站点**的产物之间匹配——两个产物频率差绝对值
   `|fa − fb| ≤ tolerance_hz` 即构成一条跨站点冲突配对；**同一站点**的产物即使频率相近也
@@ -425,7 +431,9 @@ curl -X POST http://localhost:8000/sites/1/analysis
 ## 多站点原子批量分析（batch analysis）
 
 `POST /sites/analyses/batch` 接收 **1～10 个不重复的已保存站点 ID**（正整数；
-列表为空、超过 10 个、ID 重复或非正 → `422`），**按输入顺序**逐站执行与单站接口
+列表为空、超过 10 个、ID 重复或非正 → `422`）。ID **只接受 JSON 整数**：布尔值、
+浮点数、数字字符串（如 `[true, 2]`、`[1.0, 2]`、`["1", 2]`）一律 `422`，整批不会
+启动任何分析或写库。**按输入顺序**逐站执行与单站接口
 `POST /sites/{site_id}/analysis` 完全相同的分析逻辑并保存结果。
 
 - **任一不存在即整批 404**：事务开始后先确认全部站点存在；任一站点不存在即整批返回
@@ -683,6 +691,14 @@ docker compose start api
 
 ## 校验规则（整批拒绝）
 
+- **仅接受 JSON 整数**：所有请求体中的整数字段——站点配置（`scan_start_hz`、
+  `scan_end_hz`、`guard_interval_hz`、`carriers_hz`）与其保护频段（`start_hz`、
+  `end_hz`）、批量分析站点 ID（`site_ids`）、单载频迁频区间（`old_hz`、
+  `start_hz`、`end_hz`）、漂移容差条目（`carrier_hz`、`tolerance_hz`）以及跨站冲突
+  参数（`site_ids`、`tolerance_hz`）——都必须是 JSON number 中的整数。布尔值
+  （`true`/`false`，不会被当作 `1`/`0`）、浮点数（`1.0`，即便数值恰好为整数）、
+  数字字符串（`"1"`）一律返回 `422`，**整批拒绝**：不写入任何站点/频段/载频数据，
+  批量分析与跨站检测也不会启动分析。
 - 载频必须为正整数 Hz 且**不得重复**；至少 1 个载频。
 - 扫描范围：`scan_end_hz > scan_start_hz`，均为正整数。
 - 保护频段：`end_hz > start_hz`，均为正整数。
@@ -854,7 +870,8 @@ curl -X POST http://localhost:8000/maintenance/backups \
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（132 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
+# 运行测试（175 个用例，覆盖创建、校验拒绝、严格 JSON 整数（布尔/浮点/数字字符串 → 422、
+# 整批不写库不启动分析）、聚合、距离、持久化查询、风险分组、最小停用方案、
 # 现场复测扫描窗口（覆盖最大化、窗口数与字典序并列、边界截断、参数校验与 404）、
 # 新增载频禁用区间、单载频迁移规划、载频漂移风险评估、跨站点冲突检测，幂等键的重复重放、失败回滚与并发去重，
 # 多站点原子批量分析的顺序一致、404 整批不保存与失败整批回滚，

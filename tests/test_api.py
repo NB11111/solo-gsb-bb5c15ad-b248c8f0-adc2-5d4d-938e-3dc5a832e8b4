@@ -76,6 +76,50 @@ def test_non_positive_values_rejected(client):
     assert client.get("/sites").json() == []
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"scan_start_hz": True},
+        {"scan_start_hz": False},
+        {"scan_start_hz": 1.0},
+        {"scan_start_hz": "1"},
+        {"scan_end_hz": True},
+        {"scan_end_hz": 10_000.0},
+        {"scan_end_hz": "10000"},
+        {"guard_interval_hz": True},
+        {"guard_interval_hz": 150.0},
+        {"guard_interval_hz": "150"},
+        {"carriers_hz": [True, 300, 400]},
+        {"carriers_hz": [100.0, 300, 400]},
+        {"carriers_hz": ["100", 300, 400]},
+        {"guard_bands": [{"start_hz": True, "end_hz": 520}]},
+        {"guard_bands": [{"start_hz": 480.0, "end_hz": 520}]},
+        {"guard_bands": [{"start_hz": "480", "end_hz": 520}]},
+        {"guard_bands": [{"start_hz": 480, "end_hz": True}]},
+        {"guard_bands": [{"start_hz": 480, "end_hz": 520.0}]},
+    ],
+)
+def test_site_integer_fields_reject_bool_float_string(client, overrides):
+    # 整数字段仅接受 JSON 整数：布尔/浮点/数字字符串一律 422，且整批不写库
+    assert client.post("/sites", json=make_payload(**overrides)).status_code == 422
+    assert client.get("/sites").json() == []
+
+
+def test_site_integer_fields_still_accept_plain_integers(client):
+    # 合法 JSON 整数（含 guard_interval_hz=0）行为与响应不变
+    resp = client.post(
+        "/sites",
+        json=make_payload(guard_interval_hz=0, guard_bands=[{"start_hz": 480, "end_hz": 520}]),
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["scan_start_hz"] == 1
+    assert body["scan_end_hz"] == 10_000
+    assert body["guard_interval_hz"] == 0
+    assert body["carriers_hz"] == [100, 300, 400]
+    assert body["guard_bands"] == [{"start_hz": 480, "end_hz": 520}]
+
+
 def test_duplicate_site_name_conflict(client):
     assert client.post("/sites", json=make_payload()).status_code == 201
     resp = client.post("/sites", json=make_payload())
@@ -1042,6 +1086,32 @@ def test_carrier_relocation_422_validation(client):
     assert ok.json()["new_hz"] == 700
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        _reloc_body(100, True, 10000),
+        _reloc_body(100, 1, 10000.0),
+        _reloc_body(100, "1", 10000),
+        _reloc_body(100, 1, "10000"),
+        {"old_hz": "400", "start_hz": 1, "end_hz": 10000},
+    ],
+)
+def test_carrier_relocation_rejects_bool_float_string_integers(client, body):
+    client.post("/sites", json=make_payload())
+    assert client.post("/sites/1/carrier-relocation", json=body).status_code == 422
+    # 拒绝时不修改站点、不产生分析
+    assert client.get("/sites/1").json()["carriers_hz"] == [100, 300, 400]
+    assert client.get("/sites/1/analyses").json() == []
+
+
+def test_carrier_relocation_rejects_bool_old_hz_that_would_coerce_to_carrier(client):
+    # 宽松模式下 true 会被当成 1（恰好是本站载频）从而得到 200；严格整数须 422
+    client.post("/sites", json=make_payload(carriers_hz=[1, 300, 400]))
+    body = {"old_hz": True, "start_hz": 1, "end_hz": 10000}
+    assert client.post("/sites/1/carrier-relocation", json=body).status_code == 422
+    assert client.get("/sites/1/analyses").json() == []
+
+
 def test_carrier_relocation_does_not_modify_site_or_save_analysis(client):
     # 该端点不修改站点配置、不保存分析：调用前后站点与分析记录完全不变
     client.post("/sites", json=make_payload())
@@ -1476,6 +1546,43 @@ def test_cross_site_conflicts_422_validation(client):
     assert post({"site_ids": [998, 998], "tolerance_hz": 10}).status_code == 422
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"site_ids": [True, 2], "tolerance_hz": 10},
+        {"site_ids": [1, False], "tolerance_hz": 10},
+        {"site_ids": [1, 2.0], "tolerance_hz": 10},
+        {"site_ids": ["1", 2], "tolerance_hz": 10},
+        {"site_ids": [1, 2], "tolerance_hz": True},
+        {"site_ids": [1, 2], "tolerance_hz": False},
+        {"site_ids": [1, 2], "tolerance_hz": 10.0},
+        {"site_ids": [1, 2], "tolerance_hz": "10"},
+    ],
+)
+def test_cross_site_conflicts_rejects_bool_float_string_integers(client, body):
+    _make_site(client, 1)
+    _make_site(client, 2)
+    a1 = _analyze(client, 1)
+    a2 = _analyze(client, 2)
+    assert client.post("/cross-site-conflicts", json=body).status_code == 422
+    # 拒绝时不启动新分析，已有分析记录不变
+    assert [m["analysis_id"] for m in client.get("/sites/1/analyses").json()] == [a1]
+    assert [m["analysis_id"] for m in client.get("/sites/2/analyses").json()] == [a2]
+
+
+def test_cross_site_conflicts_still_accepts_plain_integers(client):
+    # tolerance_hz=0 为合法整数边界：仍按仅同频配对正常返回
+    _make_site(client, 1, carriers_hz=[100, 300, 400], scan_end_hz=10_000)
+    _make_site(client, 2, carriers_hz=[100, 300, 400], scan_end_hz=10_000)
+    _analyze(client, 1)
+    _analyze(client, 2)
+    resp = client.post(
+        "/cross-site-conflicts", json={"site_ids": [1, 2], "tolerance_hz": 0}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["tolerance_hz"] == 0
+
+
 def test_cross_site_conflicts_does_not_write_analysis(client):
     # 检测只读取已保存分析，不产生新的分析记录
     _make_site(client, 1, carriers_hz=[100, 300, 400], scan_end_hz=10_000)
@@ -1592,6 +1699,26 @@ def test_batch_analysis_422_validation(client):
     assert post({"site_ids": [1.5]}).status_code == 422
     # 校验先于站点查询：重复 ID 即使站点不存在也先 422
     assert post({"site_ids": [998, 998]}).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "site_ids",
+    [
+        [True, 2],
+        [1, False],
+        [1, 2.0],
+        ["1", 2],
+    ],
+)
+def test_batch_analysis_rejects_non_integer_ids_and_starts_no_analysis(client, site_ids):
+    _make_site(client, 1)
+    _make_site(client, 2)
+    resp = client.post("/sites/analyses/batch", json={"site_ids": site_ids})
+    assert resp.status_code == 422, resp.text
+    # 整批不启动分析：任何站点都不得新增分析记录
+    for site_id in (1, 2):
+        assert client.get(f"/sites/{site_id}/analysis").status_code == 404
+        assert client.get(f"/sites/{site_id}/analyses").json() == []
 
 
 def test_batch_analysis_404_missing_site_saves_nothing(client):
@@ -1961,6 +2088,25 @@ def test_drift_risk_mapping_validation(client):
     # 空映射 / 缺请求体
     assert client.post(url, json={"tolerances": []}).status_code == 422
     assert client.post(url).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "tolerances",
+    [
+        [(True, 0), (300, 0), (400, 0)],
+        [(100, True), (300, 0), (400, 0)],
+        [(100, 0.0), (300, 0), (400, 0)],
+        [("100", 0), (300, 0), (400, 0)],
+        [(100, "0"), (300, 0), (400, 0)],
+    ],
+)
+def test_drift_risk_rejects_bool_float_string_integers(client, tolerances):
+    client.post("/sites", json=make_payload())
+    # 宽松模式下这些值会被当作合法载频/容差（true→1、100.0→100、'0'→0）；
+    # 严格整数一律 422，且不执行/保存分析
+    resp = client.post("/sites/1/drift-risk", json=_drift_body(tolerances))
+    assert resp.status_code == 422
+    assert client.get("/sites/1/analyses").json() == []
 
 
 def test_drift_risk_does_not_save_analysis(client):
